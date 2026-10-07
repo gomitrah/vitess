@@ -494,6 +494,26 @@ func TestNormalizeInvalidDates(t *testing.T) {
 	}
 }
 
+func TestNormalizeSelectIntoVariables(t *testing.T) {
+	queries := []string{
+		"select 1 into @x",
+		"select id from t limit 1 into @x",
+		"select id, col from t limit 1 into @x, @y",
+		"select 1 from dual union select 2 from dual into @x",
+	}
+	parser := NewTestParser()
+	for _, query := range queries {
+		t.Run(query, func(t *testing.T) {
+			stmt, err := parser.Parse(query)
+			require.NoError(t, err)
+			known := getBindvars(stmt)
+			bv := make(map[string]*querypb.BindVariable)
+			_, err = Normalize(stmt, NewReservedVars("bv", known), bv, true, "ks", 0, "", map[string]string{}, nil, nil)
+			require.EqualError(t, err, "VT12001: unsupported: SELECT ... INTO variables")
+		})
+	}
+}
+
 func TestNormalizeValidSQL(t *testing.T) {
 	parser := NewTestParser()
 	for _, tcase := range validSQL {

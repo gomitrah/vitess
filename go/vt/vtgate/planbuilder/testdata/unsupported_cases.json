@@ -260,6 +260,26 @@
     "plan": "VT12001: unsupported: Assignment expression"
   },
   {
+    "comment": "select into user-defined variable from dual",
+    "query": "select 1 into @x",
+    "plan": "VT12001: unsupported: SELECT ... INTO variables"
+  },
+  {
+    "comment": "select into user-defined variables from unsharded table",
+    "query": "select id, col from unsharded limit 1 into @x, @y",
+    "plan": "VT12001: unsupported: SELECT ... INTO variables"
+  },
+  {
+    "comment": "select into user-defined variable from sharded table",
+    "query": "select id from user limit 1 into @x",
+    "plan": "VT12001: unsupported: SELECT ... INTO variables"
+  },
+  {
+    "comment": "union into user-defined variable",
+    "query": "select 1 from dual union select 2 from dual into @x",
+    "plan": "VT12001: unsupported: SELECT ... INTO variables"
+  },
+  {
     "comment": "explain - routed table with join on different keyspace table",
     "query": "explain select 1, second_user.foo.id, foo.col from second_user.foo join user.user join main.unsharded",
     "plan": "VT03031: EXPLAIN is only supported for single keyspace"

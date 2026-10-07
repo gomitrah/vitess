@@ -181,6 +181,14 @@ func (nz *normalizer) walkDown(node, _ SQLNode) bool {
 	case *AssignmentExpr:
 		nz.err = vterrors.VT12001("Assignment expression")
 		return false
+	case *SelectInto:
+		// The INTO targets are assignment targets, not values, so they must not be rewritten into bind
+		// variables. Passing the statement through would set the variables on a tablet connection instead
+		// of the session, so reject it.
+		if node.Type == IntoVariables {
+			nz.err = vterrors.VT12001("SELECT ... INTO variables")
+		}
+		return false
 	case *DerivedTable:
 		nz.inDerived++
 	case *Select:
