@@ -593,6 +593,12 @@ func (tsv *TabletServer) begin(
 				if err != nil {
 					return err
 				}
+				// The transaction's connection goes back to the pool when the
+				// transaction ends, unless it is reserved, so a statement that
+				// changes its session needs the same check as in Execute.
+				if err := plan.IsValid(reservedID != 0, len(settings) > 0); err != nil {
+					return err
+				}
 
 				qre := &QueryExecutor{
 					ctx:              ctx,
