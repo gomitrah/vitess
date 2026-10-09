@@ -1008,6 +1008,105 @@ func TestTabletServerRewritesDoubleSlashCommentsInSetupQueries(t *testing.T) {
 	assert.Positive(t, db.GetQueryCalledNum("savepoint a #/ x"), "query log: %s", db.QueryLog())
 }
 
+// setupPostBeginQueriesTest returns a tablet server whose fake MySQL accepts the
+// statements of postBeginQueriesNeedingReservedConn.
+func setupPostBeginQueriesTest(t *testing.T) (*fakesqldb.DB, *TabletServer) {
+	db, tsv := setupTabletServerTest(t, t.Context(), "")
+	t.Cleanup(tsv.StopService)
+	t.Cleanup(db.Close)
+
+	db.AddQueryPattern("set character_set_client = 'latin1'", &sqltypes.Result{})
+	db.AddQueryPattern("create temporary table .*", &sqltypes.Result{})
+	db.AddQueryPattern("select get_lock\\(.*", sqltypes.MakeTestResult(sqltypes.MakeTestFields("get_lock('l', 10)", "int64"), "1"))
+	db.AddQuery("select @@session.wait_timeout", sqltypes.MakeTestResult(
+		sqltypes.MakeTestFields("@@session.wait_timeout", "int64"),
+		"28800",
+	))
+	db.AddQuery("select 1 from dual limit 10001", &sqltypes.Result{})
+	db.AddQuery("select 1 from dual", &sqltypes.Result{})
+	return db, tsv
+}
+
+// postBeginQueriesNeedingReservedConn are statements that leave state on the
+// connection's session, each with a part of its text to look for in the query
+// log.
+var postBeginQueriesNeedingReservedConn = []struct {
+	query  string
+	marker string
+}{
+	{query: "set character_set_client = 'latin1'", marker: "latin1"},
+	{query: "create temporary table temp_t(id int)", marker: "temp_t"},
+	{query: "select get_lock('l', 10) from dual", marker: "get_lock"},
+}
+
+// TestBeginRejectsPostBeginQueriesNeedingReservedConn checks that a statement
+// that changes the connection's session is rejected in the postBeginQueries of
+// a transaction without a reserved connection, as it is in Execute, instead of
+// changing the session of a connection that goes back to the pool.
+func TestBeginRejectsPostBeginQueriesNeedingReservedConn(t *testing.T) {
+	target := querypb.Target{TabletType: topodatapb.TabletType_PRIMARY}
+	for _, tc := range postBeginQueriesNeedingReservedConn {
+		t.Run("BeginExecute/"+tc.query, func(t *testing.T) {
+			db, tsv := setupPostBeginQueriesTest(t)
+
+			state, _, err := tsv.BeginExecute(t.Context(), nil, &target, []string{tc.query}, "select 1", nil, 0, nil)
+			requireNeedsReservedConn(t, err)
+			rollbackIfStarted(t, tsv, &target, state.TransactionID)
+			assert.NotContains(t, db.QueryLog(), tc.marker)
+		})
+
+		t.Run("BeginStreamExecute/"+tc.query, func(t *testing.T) {
+			db, tsv := setupPostBeginQueriesTest(t)
+
+			state, err := tsv.BeginStreamExecute(t.Context(), nil, &target, []string{tc.query}, "select 1", nil, 0, nil,
+				func(*sqltypes.Result) error { return nil })
+			requireNeedsReservedConn(t, err)
+			rollbackIfStarted(t, tsv, &target, state.TransactionID)
+			assert.NotContains(t, db.QueryLog(), tc.marker)
+		})
+	}
+}
+
+// TestReserveBeginExecuteRunsPostBeginQueriesOnReservedConn checks that
+// ReserveBeginExecute runs a statement in postBeginQueries that changes the
+// connection's session on a reserved connection, rather than on the pooled
+// connection of a transaction with settings, which it tries first.
+func TestReserveBeginExecuteRunsPostBeginQueriesOnReservedConn(t *testing.T) {
+	target := querypb.Target{TabletType: topodatapb.TabletType_PRIMARY}
+	for _, tc := range []struct {
+		query  string
+		marker string
+	}{
+		{query: "set character_set_client = 'latin1'", marker: "latin1"},
+		{query: "create temporary table temp_t(id int)", marker: "temp_t"},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			db, tsv := setupPostBeginQueriesTest(t)
+
+			state, _, err := tsv.ReserveBeginExecute(t.Context(), nil, &target, nil, []string{tc.query}, "select 1", nil, nil)
+			require.NoError(t, err)
+			assert.NotZero(t, state.ReservedID, "the statement ran without a reserved connection")
+			assert.Contains(t, db.QueryLog(), tc.marker)
+			require.NoError(t, tsv.Release(t.Context(), &target, state.TransactionID, state.ReservedID))
+		})
+	}
+}
+
+func requireNeedsReservedConn(t *testing.T, err error) {
+	t.Helper()
+	require.Error(t, err)
+	assert.Equal(t, vtrpcpb.Code_FAILED_PRECONDITION, vterrors.Code(err))
+	assert.ErrorContains(t, err, "not allowed without reserved connection")
+}
+
+func rollbackIfStarted(t *testing.T, tsv *TabletServer, target *querypb.Target, transactionID int64) {
+	t.Helper()
+	if transactionID != 0 {
+		_, err := tsv.Rollback(t.Context(), target, transactionID)
+		require.NoError(t, err)
+	}
+}
+
 // TestTabletServerTxSerializerKeyRewritesDoubleSlashComments checks that hot
 // row protection plans a statement with a "//" comment under the same plan
 // cache entry as its execution, which plans the rewritten text.
