@@ -593,30 +593,40 @@ func (call *builtinChangeCase) eval(env *ExpressionEnv) (eval, error) {
 		return nil, err
 	}
 
+	var b *evalBytes
 	switch e := arg.(type) {
 	case nil:
 		return nil, nil
 
-	case evalNumeric:
-		return evalToVarchar(e, call.collate, false)
-
 	case *evalBytes:
-		coll := colldata.Lookup(e.col.Collation)
-		csa, ok := coll.(colldata.CaseAwareCollation)
-		if !ok {
-			return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "not implemented")
-		}
-		var newcase []byte
-		if call.upcase {
-			newcase = csa.ToUpper(nil, e.bytes)
-		} else {
-			newcase = csa.ToLower(nil, e.bytes)
-		}
-		return newEvalText(newcase, e.col), nil
+		b = e
+
+	case *evalJSON:
+		b = newEvalText(e.ToRawBytes(), collationJSON)
 
 	default:
-		return e, nil
+		b, err = evalToVarchar(e, call.collate, true)
+		if err != nil {
+			return nil, err
+		}
 	}
+
+	coll := colldata.Lookup(b.col.Collation)
+	csa, ok := coll.(colldata.CaseAwareCollation)
+	if !ok {
+		return nil, vterrors.Errorf(vtrpcpb.Code_UNIMPLEMENTED, "not implemented")
+	}
+	var newcase []byte
+	if call.upcase {
+		newcase = csa.ToUpper(nil, b.bytes)
+	} else {
+		newcase = csa.ToLower(nil, b.bytes)
+	}
+	if b.isBinary() {
+		// A binary argument stays binary, and is no longer a hex or bit literal.
+		return newEvalRaw(sqltypes.VarBinary, newcase, b.col), nil
+	}
+	return newEvalText(newcase, b.col), nil
 }
 
 func (call *builtinChangeCase) compile(c *compiler) (ctype, error) {
@@ -627,16 +637,22 @@ func (call *builtinChangeCase) compile(c *compiler) (ctype, error) {
 
 	skip := c.compileNullCheck1(str)
 
+	// A textual or binary argument keeps its type, size and collation.
+	res := ctype{Type: str.Type, Size: str.Size, Col: str.Col, Flag: nullableFlags(str.Flag)}
 	switch {
 	case str.isTextual():
+	case str.Type == sqltypes.TypeJSON:
+		c.asm.Convert_xc(1, sqltypes.VarChar, collationJSON.Collation, nil)
+		res = ctype{Type: sqltypes.VarChar, Col: collationJSON, Flag: nullableFlags(str.Flag)}
 	default:
 		c.asm.Convert_xc(1, sqltypes.VarChar, c.collation, nil)
+		res = ctype{Type: sqltypes.VarChar, Col: typedCoercionCollation(sqltypes.VarChar, c.collation), Flag: nullableFlags(str.Flag)}
 	}
 
 	c.asm.Fn_LUCASE(call.upcase)
 	c.asm.jumpDestination(skip)
 
-	return str, nil
+	return res, nil
 }
 
 func (call *builtinCharLength) eval(env *ExpressionEnv) (eval, error) {
